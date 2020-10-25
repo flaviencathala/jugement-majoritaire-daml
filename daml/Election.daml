@@ -1,0 +1,160 @@
+module Election where
+
+import Vote
+import DA.Foldable (forA_)
+import DA.Optional (isSome, fromSome)
+import DA.TextMap as TM
+import DA.NonEmpty as NE
+import DA.List (findIndex, head)
+import DA.Action (void)
+
+data ElectionStatus = Upcoming | Ongoing | Finished
+            deriving (Eq, Show)
+
+template Election
+  with
+    organizer     : Party
+    name          : Text
+    candidates    : NonEmpty Party
+    voters        : NonEmpty Party
+    status        : ElectionStatus
+  where
+    signatory organizer
+    key (organizer, name) : (Party, Text)
+    maintainer key._1
+    observer voters
+    controller organizer can
+      StartElection : ContractId Election
+        do
+          forA_ candidates (\candidate -> forA_ rates (\rate -> create ElectionRate with electionOrganizer = organizer, electionName = name, amount = 0, ..))
+          forA_ voters (\voter -> create VoteInvite with electionOrganizer = organizer, electionName = name, ..)
+          create this with status = Ongoing
+      EndElection : (ContractId Election, ContractId ElectionResult)
+        do
+          create ElectionResult with electionOrganizer = organizer, electionName = name, finalResult = False, winners = candidates, missingVotes = 0, ..
+          -- collect votes
+          forA_ voters $ \voter ->
+            do
+              voteId <- lookupByKey @Vote(organizer, name, voter)
+              if isSome voteId
+                then do
+                    (_, vote) <- fetchByKey @Vote(organizer, name, voter)
+                    forA_ vote.grades (\grade -> exerciseByKey @ElectionRate(organizer, name, grade.candidate, grade.rate) $ UpdateGrade)
+              else
+                void $ exerciseByKey @ElectionResult(organizer, name) AddMissingVote
+
+          -- calculate average rate and distance from above rate
+          let median = length (NE.toList voters) / 2
+          let counter = TM.fromList (NE.toList (NE.map (\candidate -> (partyToText candidate, 0)) candidates))
+          forA_ candidates $ \candidate ->
+            do
+              create CandidateResult with average = head rates, distanceFromAboveRate = 0, voteCount = 0, electionOrganizer = organizer, electionName = name, ..
+              forA_ rates $ \rate ->
+                do
+                  (_, nextRate) <- fetchByKey @ElectionRate(organizer, name, candidate, rate)
+                  (candidateResultId, candidateResult) <- fetchByKey @CandidateResult(organizer, name, candidate)
+                  let voteCount = candidateResult.voteCount + nextRate.amount
+                  if (voteCount < median) || (voteCount >= median && (voteCount - nextRate.amount) <= median)
+                    then exercise candidateResultId UpdateResult with newAverage = nextRate.rate, newDistanceFromAboveRate = nextRate.amount, newVoteCount = voteCount
+                  else
+                    exercise candidateResultId UpdateVoteCount with newVoteCount = voteCount
+
+          -- find the winner(s)
+          forA_ candidates $ \candidate ->
+            do
+              (electionResultId, electionResult) <- fetchByKey @ElectionResult(organizer, name)
+              (_, currentWinnerResult) <- fetchByKey @CandidateResult(organizer, name, head (NE.toList electionResult.winners))
+              (_, candidateResult) <- fetchByKey @CandidateResult(organizer, name, candidate)
+              if ((findIndex (\r -> r == candidateResult.average) rates) < (findIndex (\r -> r == currentWinnerResult.average) rates)) ||
+                 ((findIndex (\r -> r == candidateResult.average) rates) == (findIndex (\r -> r == currentWinnerResult.average) rates) && (isDistanceFromAboveRateWinning candidateResult.average currentWinnerResult.distanceFromAboveRate candidateResult.distanceFromAboveRate))
+                then exercise electionResultId UpdateWinner with newWinner = candidate
+              else if ((findIndex (\r -> r == candidateResult.average) rates) == (findIndex (\r -> r == currentWinnerResult.average) rates) && (candidateResult.distanceFromAboveRate == currentWinnerResult.distanceFromAboveRate))
+                then exercise electionResultId AddWinner with newWinner = candidate
+              else
+                exercise electionResultId ConfirmIteration
+          electionResult <- exerciseByKey @ElectionResult(organizer, name) ConfirmResult
+          election <- create this with status = Finished
+
+          return (election, electionResult)
+
+template ElectionRate
+  with
+    electionOrganizer : Party
+    electionName      : Text
+    candidate         : Party
+    rate              : Rate
+    amount            : Int
+  where
+    signatory electionOrganizer
+    key (electionOrganizer, electionName, candidate, rate) : (Party, Text, Party, Rate)
+    maintainer key._1
+    observer candidate
+    controller electionOrganizer can
+      UpdateGrade : ContractId ElectionRate
+        do
+          create this with amount = amount + 1
+
+template CandidateResult
+  with
+    electionOrganizer     : Party
+    electionName          : Text
+    candidate             : Party
+    average               : Rate
+    distanceFromAboveRate : Int
+    voteCount             : Int
+  where
+    signatory electionOrganizer
+    key (electionOrganizer, electionName, candidate) : (Party, Text, Party)
+    maintainer key._1
+    observer candidate
+    controller electionOrganizer can
+      UpdateResult : ContractId CandidateResult
+        with  newAverage               : Rate
+              newDistanceFromAboveRate : Int
+              newVoteCount             : Int
+        do
+          create this with average = newAverage, distanceFromAboveRate = newDistanceFromAboveRate, voteCount = newVoteCount
+      UpdateVoteCount : ContractId CandidateResult
+        with  newVoteCount : Int
+        do
+          create this with voteCount = newVoteCount
+
+isDistanceFromAboveRateWinning : Rate -> Int -> Int -> Bool
+isDistanceFromAboveRateWinning rate distanceWinning distanceToCompare =
+  if rate == (head rates)
+    then distanceWinning < distanceToCompare
+  else
+    distanceWinning > distanceToCompare
+
+template ElectionResult
+  with
+    electionOrganizer : Party
+    electionName      : Text
+    candidates        : NonEmpty Party
+    missingVotes      : Int
+    voters            : NonEmpty Party
+    winners           : NonEmpty Party
+    finalResult       : Bool
+  where
+    signatory electionOrganizer
+    key (electionOrganizer, electionName) : (Party, Text)
+    maintainer key._1
+    observer candidates, voters
+    controller electionOrganizer can
+      AddMissingVote : ContractId ElectionResult
+        do
+          create this with missingVotes = missingVotes + 1
+      UpdateWinner : ContractId ElectionResult
+        with newWinner : Party
+        do
+          create this with winners = fromSome (NE.nonEmpty [newWinner])
+      AddWinner : ContractId ElectionResult
+        with newWinner : Party
+        do
+          create this with winners = append winners (fromSome (NE.nonEmpty [newWinner]))
+      ConfirmIteration : ContractId ElectionResult
+        do
+          create this with finalResult = False
+      ConfirmResult : ContractId ElectionResult
+        do
+          create this with finalResult = True

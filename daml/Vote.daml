@@ -1,0 +1,42 @@
+module Vote where
+
+import DA.NonEmpty (toList, NonEmpty)
+import DA.List (mapAccumL)
+
+data Rate = Excellent | VeryGood | Good | Acceptable | Poor | VeryPoor | Reject
+            deriving (Eq, Show)
+-- rates must be defined from the best to the worst
+rates = [Excellent, VeryGood, Good, Acceptable, Poor, VeryPoor, Reject]
+
+data Grade =  Grade with candidate: Party, rate: Rate
+              deriving (Eq, Show)
+
+template Vote
+  with
+    voter             : Party
+    electionOrganizer : Party
+    electionName      : Text
+    candidates        : NonEmpty Party
+    grades            : NonEmpty Grade
+  where
+    signatory electionOrganizer, voter
+    -- ensure grades contain only registered candidates
+    ensure not (mapAccumL (\f g -> ((f || (notElem g.candidate (toList candidates))), g)) False (toList grades))._1
+    key (electionOrganizer, electionName, voter) : (Party, Text, Party)
+    maintainer key._1
+
+template VoteInvite
+  with
+    electionOrganizer : Party
+    electionName      : Text
+    candidates        : NonEmpty Party
+    voter             : Party
+  where
+    signatory electionOrganizer
+    key (electionOrganizer, electionName, voter) : (Party, Text, Party)
+    maintainer key._1
+    controller voter can
+      AcceptVoteInvite : ContractId Vote
+        with grades : NonEmpty Grade
+        do
+          create Vote with ..

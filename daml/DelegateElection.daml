@@ -1,0 +1,43 @@
+module DelegateElection where
+
+import Daml.Script
+import Election
+import Vote
+import DA.NonEmpty (NonEmpty, toList, nonEmpty)
+import DA.Optional (fromSome)
+import DA.List (head)
+
+delegateElection : Script ()
+delegateElection = script do
+  school <- allocateParty "School"
+
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  john <- allocateParty "John"
+  joe <- allocateParty "Joe"
+  jack <- allocateParty "Jack"
+
+
+  delegateElection <- school `submit` createCmd Election with organizer = school, name = "delegate", candidates = ctne [alice, bob], voters = ctne [john, joe, jack], status = Upcoming
+  delegateElection <- school `submit` exerciseCmd delegateElection StartElection
+
+  john `submit` exerciseByKeyCmd @VoteInvite(school, "delegate", john) AcceptVoteInvite with grades =  gtne [(Grade with candidate = alice, rate = Excellent), (Grade with candidate = bob, rate = Excellent)]
+  joe `submit` exerciseByKeyCmd @VoteInvite(school, "delegate", joe) AcceptVoteInvite with grades = gtne [(Grade with candidate = alice, rate = Poor), (Grade with candidate = bob, rate = Acceptable)]
+  jack `submit` exerciseByKeyCmd @VoteInvite(school, "delegate", jack) AcceptVoteInvite with grades = gtne [(Grade with candidate = alice, rate = Good), (Grade with candidate = bob, rate = Reject)]
+
+  (_, delegateElectionResultId) <- school `submit` exerciseCmd delegateElection EndElection
+
+  delegateElectionResult <- queryContractId school delegateElectionResultId
+  assert (head (toList ((fromSome delegateElectionResult).winners)) == alice)
+
+  pure ()
+
+-- helpers
+gtne : [Grade] -> NonEmpty Grade
+gtne list =
+  fromSome (nonEmpty list)
+
+ctne : [Party] -> NonEmpty Party
+ctne list =
+  fromSome (nonEmpty list)
